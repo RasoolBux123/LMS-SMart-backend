@@ -3,6 +3,11 @@ Notifications API.
 
 - Instructor publishes assignment/quiz/exam/project → enrolled students get notified
 - Admin creates/assigns course or enrolls student → assigned instructor gets notified
+
+The same publish event also fires the n8n webhook (see
+app/services/n8n_webhook.py), which sends the students an AI-written email. It's
+hooked in here rather than in coursework.py because all three publish paths
+(create, update, status change) already funnel through notify_enrolled_students.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.deps import get_current_user
 from app.core.database import database
+from app.services.n8n_webhook import trigger_content_created
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -113,8 +119,9 @@ async def notify_enrolled_students(
     instructor_name: str = "Instructor",
 ) -> int:
     """
-    Create one notification per enrolled student for a newly published item.
-    Returns the number of notifications created.
+    Create one notification per enrolled student for a newly published item,
+    then hand the same event to n8n so the students also get an email.
+    Returns the number of in-app notifications created.
     """
     db = database.db
     if not course_id or not coursework_id:
@@ -167,11 +174,20 @@ async def notify_enrolled_students(
             }
         )
 
-    if not docs:
-        return 0
+    created = 0
+    if docs:
+        result = await db.notifications.insert_many(docs)
+        created = len(result.inserted_ids)
 
-    result = await db.notifications.insert_many(docs)
-    return len(result.inserted_ids)
+    # Email via n8n — fire-and-forget, never blocks or fails the publish.
+    await trigger_content_created(
+        kind=coursework_kind,
+        coursework_id=str(coursework_id),
+        course_id=str(course_id),
+        instructor_name=instructor_name,
+    )
+
+    return created
 
 
 @router.get("")
@@ -239,7 +255,6 @@ async def mark_all_read(user: dict = Depends(get_current_user)):
         "data": {"updated": result.modified_count},
         "message": "all marked as read",
     }
-
 
 # """
 # Notifications API.

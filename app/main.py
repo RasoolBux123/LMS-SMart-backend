@@ -18,6 +18,9 @@ from app.api import programs
 from app.api import credentials
 from app.api import certificates  # NEW
 
+
+from app.api import reminders          # baaki app.api imports ke saath
+
 from app.api import notifications
 from app.api import calendar
 # Unified coursework (assignments / quizzes / exams / projects)
@@ -125,3 +128,4 @@ app.include_router(submissions_router)
 
 # Grading report (instructor grading page)
 app.include_router(grading.router)
+app.include_router(reminders.router)   # baaki include_router ke saath

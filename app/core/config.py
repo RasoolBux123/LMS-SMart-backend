@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 10080
 
+    # --- n8n ---------------------------------------------------------------
+    # Leave N8N_WEBHOOK_URL blank to switch the integration off entirely.
+    n8n_webhook_url: str = ""
+    n8n_webhook_secret: str = ""
+    n8n_webhook_header: str = "X-SmartLMS-Secret"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=False,
