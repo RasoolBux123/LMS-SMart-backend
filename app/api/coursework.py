@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import get_current_user, require_roles
 from app.core.database import database
-from app.api.notifications import notify_enrolled_students
+from app.api.notifications import notify_enrolled_students, notify_user
 
 Status = Literal["draft", "published", "archived"]
 
@@ -926,6 +926,51 @@ projects_router = create_coursework_router(
 
 submissions_router = APIRouter(prefix="/submissions", tags=["submissions"])
 
+# submission id_field → which parent collection(s) to look the item up in.
+# `assignmentId` is shared by assignments and projects (see _SUB_COLLECTION).
+_ID_FIELD_COLLECTIONS = {
+    "assignmentId": ("assignments", "projects"),
+    "quizId": ("quizzes",),
+    "examId": ("exams",),
+}
+
+
+async def _notify_grade(db, submission: dict, id_field: str) -> None:
+    """Tell the student their work has just been graded."""
+    item_id = submission.get(id_field)
+    student_id = submission.get("studentId")
+    if not item_id or not student_id:
+        return
+
+    item = None
+    kind = "assignment"
+    if ObjectId.is_valid(str(item_id)):
+        for coll_name in _ID_FIELD_COLLECTIONS.get(id_field, ()):
+            found = await db[coll_name].find_one({"_id": ObjectId(item_id)})
+            if found:
+                item = found
+                kind = COLLECTION_KIND.get(coll_name, "assignment")
+                break
+
+    title = item.get("title", "") if item else ""
+    course_id = item.get("courseId") if item else None
+    label = kind.capitalize()
+    plural = {
+        "assignment": "assignments",
+        "quiz": "quizzes",
+        "exam": "exams",
+        "project": "projects",
+    }.get(kind, f"{kind}s")
+
+    await notify_user(
+        str(student_id),
+        f"{label} graded: {title}" if title else f"Your {kind} was graded",
+        f"Your {kind} has been graded. Check your grades page for details.",
+        kind="grade",
+        link=f"/student/{plural}",
+        course_id=course_id,
+    )
+
 
 class GradePayload(BaseModel):
     marksAwarded: Optional[float] = None
@@ -978,6 +1023,12 @@ async def grade_submission(
             },
         )
         updated = await db[sub_coll].find_one({"_id": oid})
+
+        # Let the student know their work has been graded — unless the
+        # instructor deliberately hid the marks for now.
+        if not payload.hideMarks:
+            await _notify_grade(db, updated, id_field)
+
         return {"data": _submission_row(updated, id_field), "message": "graded"}
 
     raise HTTPException(status_code=404, detail="Submission not found")
@@ -1003,6 +1054,10 @@ async def my_submissions(
                 _submission_row(s, id_field, for_student=for_student)
             )
     return {"data": results, "message": "ok"}
+
+
+
+
 
 
 
@@ -1040,8 +1095,17 @@ async def my_submissions(
 
 # from app.api.deps import get_current_user, require_roles
 # from app.core.database import database
+# from app.api.notifications import notify_enrolled_students
 
 # Status = Literal["draft", "published", "archived"]
+
+# # collection name → singular kind used by notifications
+# COLLECTION_KIND = {
+#     "assignments": "assignment",
+#     "quizzes": "quiz",
+#     "exams": "exam",
+#     "projects": "project",
+# }
 
 
 # class CourseworkPayload(BaseModel):
@@ -1270,11 +1334,23 @@ async def my_submissions(
 #     return ext
 
 
-# def _submission_row(doc: dict, id_field: str) -> dict:
+# def _submission_row(doc: dict, id_field: str, *, for_student: bool = False) -> dict:
 #     """The exact shape `Submission` in frontend/src/types/assignment.ts expects."""
 #     score = doc.get("score")
 #     if score is None:
 #         score = doc.get("marksAwarded")
+
+#     marks_hidden = bool(doc.get("marksHidden", False))
+#     # Student must not see marks/feedback while instructor has hidden them
+#     if for_student and marks_hidden:
+#         score = None
+#         feedback = None
+#         pass_fail = None
+#         status = "submitted"
+#     else:
+#         feedback = doc.get("feedback")
+#         pass_fail = doc.get("passFail")
+#         status = doc.get("status", "submitted")
 
 #     return {
 #         "id": str(doc["_id"]),
@@ -1282,13 +1358,14 @@ async def my_submissions(
 #         "studentId": doc.get("studentId", ""),
 #         "studentName": doc.get("studentName"),
 #         "studentEmail": doc.get("studentEmail"),
-#         "status": doc.get("status", "submitted"),
+#         "status": status,
 #         "submittedAt": _to_iso(doc.get("submittedAt") or doc.get("createdAt")),
 #         "files": doc.get("files") or [],
 #         "attemptNumber": doc.get("attemptNumber", 1),
 #         "marksAwarded": score,
-#         "feedback": doc.get("feedback"),
-#         "passFail": doc.get("passFail"),
+#         "feedback": feedback,
+#         "passFail": pass_fail,
+#         "marksHidden": marks_hidden,
 #     }
 
 
@@ -1470,6 +1547,21 @@ async def my_submissions(
 #         doc = _new_doc(payload, user)
 #         result = await db[collection].insert_one(doc)
 #         doc["_id"] = result.inserted_id
+
+#         # Notify enrolled students when created as published
+#         if payload.status == "published":
+#             try:
+#                 await notify_enrolled_students(
+#                     course_id=payload.courseId,
+#                     coursework_id=str(result.inserted_id),
+#                     coursework_kind=COLLECTION_KIND.get(collection, collection.rstrip("s")),
+#                     title=payload.title or doc.get("title", "New item"),
+#                     instructor_name=user.get("name") or "Instructor",
+#                 )
+#             except Exception:
+#                 # Never fail the create request because of notification errors
+#                 pass
+
 #         return _doc_to_entity(doc, collection)
 
 #     @router.patch("/{item_id}")
@@ -1490,6 +1582,14 @@ async def my_submissions(
 #             if owner and owner != str(user["_id"]):
 #                 raise HTTPException(status_code=403, detail="Not your item")
 
+#         was_published = (
+#             existing.get("status") == "published"
+#             or (
+#                 existing.get("status") is None
+#                 and existing.get("isPublished", False)
+#             )
+#         )
+
 #         update = _new_doc(payload, user)
 #         update["createdAt"] = existing.get("createdAt", update["createdAt"])
 #         update["attachments"] = existing.get("attachments", [])
@@ -1499,6 +1599,21 @@ async def my_submissions(
 #             {"_id": ObjectId(item_id)}, {"$set": update}
 #         )
 #         doc = await db[collection].find_one({"_id": ObjectId(item_id)})
+
+#         if payload.status == "published" and not was_published:
+#             try:
+#                 await notify_enrolled_students(
+#                     course_id=str(payload.courseId or existing.get("courseId") or ""),
+#                     coursework_id=item_id,
+#                     coursework_kind=COLLECTION_KIND.get(
+#                         collection, collection.rstrip("s")
+#                     ),
+#                     title=payload.title or existing.get("title") or "New item",
+#                     instructor_name=user.get("name") or "Instructor",
+#                 )
+#             except Exception:
+#                 pass
+
 #         return _doc_to_entity(doc, collection)
 
 #     @router.patch("/{item_id}/status")
@@ -1514,6 +1629,14 @@ async def my_submissions(
 #         if not existing:
 #             raise HTTPException(status_code=404, detail="Not found")
 
+#         was_published = (
+#             existing.get("status") == "published"
+#             or (
+#                 existing.get("status") is None
+#                 and existing.get("isPublished", False)
+#             )
+#         )
+
 #         await db[collection].update_one(
 #             {"_id": ObjectId(item_id)},
 #             {
@@ -1525,6 +1648,25 @@ async def my_submissions(
 #             },
 #         )
 #         doc = await db[collection].find_one({"_id": ObjectId(item_id)})
+
+#         # Notify when first published (draft/archived → published)
+#         if payload.status == "published" and not was_published:
+#             try:
+#                 course_id = str(
+#                     existing.get("courseId") or doc.get("courseId") or ""
+#                 )
+#                 await notify_enrolled_students(
+#                     course_id=course_id,
+#                     coursework_id=item_id,
+#                     coursework_kind=COLLECTION_KIND.get(
+#                         collection, collection.rstrip("s")
+#                     ),
+#                     title=existing.get("title") or doc.get("title") or "New item",
+#                     instructor_name=user.get("name") or "Instructor",
+#                 )
+#             except Exception:
+#                 pass
+
 #         return _doc_to_entity(doc, collection)
 
 #     @router.post("/{item_id}/duplicate")
@@ -1661,6 +1803,17 @@ async def my_submissions(
 #         id_field = _SUB_ID_FIELD.get(collection, "assignmentId")
 #         student_id = str(user["_id"])
 
+#         # ---- deadline: block all submissions after due date ---------------
+#         now = datetime.utcnow()
+#         deadline = _parse_dt(item.get("deadline") or item.get("dueAt"))
+#         if deadline is not None and deadline.tzinfo is not None:
+#             deadline = deadline.replace(tzinfo=None)
+#         if deadline is not None and now > deadline:
+#             raise HTTPException(
+#                 status_code=403,
+#                 detail="Deadline has passed. Submissions are no longer accepted.",
+#             )
+
 #         # ---- attempt limits ------------------------------------------------
 #         previous = await db[sub_coll].count_documents(
 #             {id_field: item_id, "studentId": student_id}
@@ -1717,11 +1870,6 @@ async def my_submissions(
 #         with open(os.path.join(sub_dir, fname), "wb") as buf:
 #             buf.write(content)
 
-#         now = datetime.utcnow()
-#         deadline = _parse_dt(item.get("deadline") or item.get("dueAt"))
-#         if deadline is not None and deadline.tzinfo is not None:
-#             deadline = deadline.replace(tzinfo=None)
-
 #         doc = {
 #             id_field: item_id,
 #             "kind": collection,
@@ -1729,7 +1877,7 @@ async def my_submissions(
 #             "studentId": student_id,
 #             "studentEmail": user.get("email", ""),
 #             "studentName": user.get("name") or user.get("fullName") or "",
-#             "status": "late" if deadline and now > deadline else "submitted",
+#             "status": "submitted",
 #             "submittedAt": now,
 #             "createdAt": now,
 #             "attemptNumber": previous + 1,
@@ -1773,7 +1921,12 @@ async def my_submissions(
 #         if not doc:
 #             return {"data": None, "message": "no submission"}
 
-#         return {"data": _submission_row(doc, id_field), "message": "ok"}
+#         return {
+#             "data": _submission_row(
+#                 doc, id_field, for_student=(user.get("role") == "student")
+#             ),
+#             "message": "ok",
+#         }
 
 #     @router.get("/{item_id}/submissions")
 #     async def list_submissions(
@@ -1787,6 +1940,41 @@ async def my_submissions(
 #         cursor = db[sub_coll].find({id_field: item_id})
 #         rows = [_submission_row(s, id_field) async for s in cursor]
 #         return {"data": rows, "message": "ok"}
+
+#     @router.post("/{item_id}/submissions/release-marks")
+#     async def release_marks(
+#         item_id: str,
+#         user: dict = Depends(require_roles("instructor", "admin")),
+#     ):
+#         """Unhide marks for every student on this item (bulk release)."""
+#         db = database.db
+#         if not ObjectId.is_valid(item_id):
+#             raise HTTPException(status_code=400, detail="Invalid id")
+
+#         item = await db[collection].find_one({"_id": ObjectId(item_id)})
+#         if not item:
+#             raise HTTPException(status_code=404, detail="Not found")
+
+#         if user["role"] == "instructor":
+#             owner = item.get("instructorId") or item.get("createdBy")
+#             if owner and owner != str(user["_id"]):
+#                 raise HTTPException(status_code=403, detail="Not your item")
+
+#         sub_coll = _SUB_COLLECTION.get(collection, "submissions")
+#         id_field = _SUB_ID_FIELD.get(collection, "assignmentId")
+
+#         result = await db[sub_coll].update_many(
+#             {
+#                 id_field: item_id,
+#                 "marksHidden": True,
+#             },
+#             {"$set": {"marksHidden": False}},
+#         )
+
+#         return {
+#             "data": {"updated": result.modified_count},
+#             "message": f"Released marks for {result.modified_count} student(s)",
+#         }
 
 #     return router
 
@@ -1808,6 +1996,8 @@ async def my_submissions(
 #     score: Optional[float] = None
 #     feedback: str = ""
 #     passFail: Optional[Literal["pass", "fail"]] = None
+#     # When True, student sees "Not graded yet" until instructor unhides
+#     hideMarks: bool = False
 
 
 # @submissions_router.patch("/{submission_id}/grade")
@@ -1845,6 +2035,7 @@ async def my_submissions(
 #                     "feedback": payload.feedback,
 #                     "passFail": payload.passFail,
 #                     "status": "graded",
+#                     "marksHidden": bool(payload.hideMarks),
 #                     "gradedAt": datetime.utcnow(),
 #                     "gradedBy": str(user["_id"]),
 #                 }
@@ -1863,6 +2054,7 @@ async def my_submissions(
 # ):
 #     db = database.db
 #     sid = str(user["_id"])
+#     for_student = user.get("role") == "student"
 #     results = []
 #     for coll, id_field in [
 #         ("submissions", "assignmentId"),
@@ -1872,30 +2064,8 @@ async def my_submissions(
 #         cursor = db[coll].find({"studentId": sid})
 #         async for s in cursor:
 #             results.append(
-#                 {
-#                     "id": str(s["_id"]),
-#                     "assignmentId": s.get(id_field)
-#                     or s.get("assignmentId", ""),
-#                     "studentId": sid,
-#                     "status": s.get("status", "submitted"),
-#                     "submittedAt": _to_iso(
-#                         s.get("submittedAt") or s.get("createdAt")
-#                     ),
-#                     "files": s.get("files") or [],
-#                     "attemptNumber": s.get("attemptNumber", 1),
-#                     "marksAwarded": s.get("score")
-#                     if s.get("score") is not None
-#                     else s.get("marksAwarded"),
-#                     "feedback": s.get("feedback"),
-#                     "passFail": s.get("passFail"),
-#                 }
+#                 _submission_row(s, id_field, for_student=for_student)
 #             )
 #     return {"data": results, "message": "ok"}
-
-
-
-
-
-
 
 

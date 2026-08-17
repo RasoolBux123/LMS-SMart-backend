@@ -214,34 +214,69 @@ async def student_grading_report(
         for_student=for_student,
     )
 
+    # ---------- Attendance calculation ----------
+    attendance_cursor = db.attendance.find({
+        "courseId": courseId,
+        "studentId": sid,
+    })
+    attendance_records = [doc async for doc in attendance_cursor]
+
+    total_sessions = len(attendance_records)
+    present_count = sum(
+        1 for r in attendance_records
+        if str(r.get("status", "")).lower() in ("present", "late")
+    )
+
+    if total_sessions > 0:
+        attendance_percent = (present_count / total_sessions) * 100
+    else:
+        attendance_percent = 0.0
+
+    # ---------- Performance components (new weightages) ----------
     components = []
+
     buckets = [
         ("Assignment", assignments, 25),
-        ("Quiz", quizzes, 25),
-        ("Project", projects, 25),
-        ("Exam", exams, 25),
+        ("Quiz", quizzes, 15),
+        ("Project", projects, 30),
+        ("Exam", exams, 20),
     ]
+
     for name, rows, weight in buckets:
-        if not rows:
-            continue
-        total_marks = sum(r["totalMarks"] for r in rows) or 1
+        total_marks = sum(r["totalMarks"] for r in rows) if rows else 0
         obtained = sum(
             (r["obtainedMarks"] or 0)
             for r in rows
             if r["obtainedMarks"] is not None
-        )
-        weighted = (obtained / total_marks) * weight if total_marks else 0
-        components.append(
-            {
-                "component": name,
-                "weightagePercent": weight,
-                "totalMarks": total_marks,
-                "obtainedMarks": obtained,
-                "weightedScorePercent": round(weighted, 2),
-            }
-        )
+        ) if rows else 0
 
-    total_weight = sum(c["weightagePercent"] for c in components) or 100
+        if total_marks > 0:
+            weighted = (obtained / total_marks) * weight
+        else:
+            weighted = 0.0
+
+        components.append({
+            "component": name,
+            "weightagePercent": weight,
+            "totalMarks": total_marks,
+            "obtainedMarks": obtained,
+            "weightedScorePercent": round(weighted, 2),
+        })
+
+    # Attendance (always included)
+    attendance_weight = 10
+    attendance_weighted = (attendance_percent / 100) * attendance_weight
+
+    components.append({
+        "component": "Attendance",
+        "weightagePercent": attendance_weight,
+        "totalMarks": 100,
+        "obtainedMarks": round(attendance_percent, 2),
+        "weightedScorePercent": round(attendance_weighted, 2),
+    })
+
+    # Totals
+    total_weight = sum(c["weightagePercent"] for c in components)
     total_marks = sum(c["totalMarks"] for c in components)
     total_obtained = sum(c["obtainedMarks"] for c in components)
     overall = sum(c["weightedScorePercent"] for c in components)
@@ -264,6 +299,15 @@ async def student_grading_report(
         },
         "message": "ok",
     }
+
+
+
+
+
+
+
+
+
 
 
 
@@ -318,6 +362,7 @@ async def student_grading_report(
 #     student_id: str,
 #     sub_coll: str,
 #     id_field: str,
+#     for_student: bool = False,
 # ) -> list[dict]:
 #     rows = []
 #     cursor = db[collection].find(
@@ -349,6 +394,8 @@ async def student_grading_report(
 #         subs = await sub_cursor.to_list(length=1)
 #         sub = subs[0] if subs else None
 
+#         marks_hidden = bool(sub.get("marksHidden", False)) if sub else False
+
 #         if not sub:
 #             status = "not_submitted"
 #             obtained = None
@@ -359,13 +406,21 @@ async def student_grading_report(
 #                 if sub.get("marksAwarded") is not None
 #                 else sub.get("score")
 #             )
-#             if sub.get("status") == "graded" or obtained is not None:
+#             remarks = sub.get("feedback") or ""
+
+#             # Student view: hide marks/feedback until instructor releases them
+#             if for_student and marks_hidden and (
+#                 sub.get("status") == "graded" or obtained is not None
+#             ):
+#                 status = "not_graded_yet"
+#                 obtained = None
+#                 remarks = ""
+#             elif sub.get("status") == "graded" or obtained is not None:
 #                 status = "submitted"
 #             elif sub.get("status") in ("submitted", "late"):
 #                 status = "pending"
 #             else:
 #                 status = "pending"
-#             remarks = sub.get("feedback") or ""
 
 #         rows.append(
 #             {
@@ -376,6 +431,7 @@ async def student_grading_report(
 #                 "remarks": remarks,
 #                 "status": status,
 #                 "submissionId": str(sub["_id"]) if sub else None,
+#                 "marksHidden": marks_hidden,
 #             }
 #         )
 #     return rows
@@ -434,6 +490,8 @@ async def student_grading_report(
 #         if ins:
 #             instructor_name = ins.get("name", "")
 
+#     for_student = user["role"] == "student"
+
 #     assignments = await _grade_rows_for(
 #         db,
 #         collection="assignments",
@@ -441,6 +499,7 @@ async def student_grading_report(
 #         student_id=sid,
 #         sub_coll="submissions",
 #         id_field="assignmentId",
+#         for_student=for_student,
 #     )
 #     quizzes = await _grade_rows_for(
 #         db,
@@ -449,6 +508,7 @@ async def student_grading_report(
 #         student_id=sid,
 #         sub_coll="quiz_attempts",
 #         id_field="quizId",
+#         for_student=for_student,
 #     )
 #     projects = await _grade_rows_for(
 #         db,
@@ -457,6 +517,7 @@ async def student_grading_report(
 #         student_id=sid,
 #         sub_coll="submissions",
 #         id_field="assignmentId",
+#         for_student=for_student,
 #     )
 #     exams = await _grade_rows_for(
 #         db,
@@ -465,6 +526,7 @@ async def student_grading_report(
 #         student_id=sid,
 #         sub_coll="exam_submissions",
 #         id_field="examId",
+#         for_student=for_student,
 #     )
 
 #     components = []
@@ -517,7 +579,4 @@ async def student_grading_report(
 #         },
 #         "message": "ok",
 #     }
-
-
-
 
