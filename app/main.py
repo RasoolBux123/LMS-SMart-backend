@@ -28,7 +28,7 @@ from app.api.coursework import (
     projects_router,
     submissions_router,
 )
-
+from app.api import ai_insights
 app = FastAPI(
     title="SmartLMS API",
     version="1.1",
@@ -115,7 +115,7 @@ app.include_router(notifications.router)
 app.include_router(calendar.router)
 app.include_router(credentials.router)
 app.include_router(certificates.router)  # NEW
-
+app.include_router(ai_insights.router)
 # Coursework
 app.include_router(assignments_router)
 app.include_router(quizzes_router)
