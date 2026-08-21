@@ -6,7 +6,7 @@ from app.core.database import database
 from app.core.security import get_password_hash
 from app.api.deps import require_roles
 from app.models.user import new_user_doc, user_to_public
-
+from bson import ObjectId
 router = APIRouter(prefix="/users", tags=["users"])
 
 
@@ -91,6 +91,47 @@ async def create_user(
         "message": "user created",
     }
 
+
+
+@router.delete("/{user_id}")
+async def delete_user(
+    user_id: str,
+    admin=Depends(require_roles("admin")),
+):
+    db = database.db
+
+    # Validate MongoDB ObjectId
+    try:
+        object_id = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid user ID"
+        )
+
+    # Find user
+    user = await db.users.find_one({"_id": object_id})
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    # Delete user
+    result = await db.users.delete_one({"_id": object_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="User could not be deleted"
+        )
+
+    return {
+        "success": True,
+        "data": None,
+        "message": "User deleted successfully"
+    }
 
 
 

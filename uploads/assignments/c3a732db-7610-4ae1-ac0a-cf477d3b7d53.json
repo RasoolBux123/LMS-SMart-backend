@@ -1,0 +1,227 @@
+{
+  "name": "SmartLMS - AI Course Content Email Notifications",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "smartlms-content-created",
+        "options": {}
+      },
+      "id": "ad18a16a-7929-4aba-ab8c-e17752da6eaa",
+      "name": "SmartLMS Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        368
+      ],
+      "webhookId": "smartlms-content-created"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The SmartLMS backend posts one content.created event per publish.\nconst raw = $input.first().json;\nconst body = raw.body ?? raw;\n\nif (!body || body.event !== 'content.created') {\n  throw new Error('Unexpected payload — expected event \"content.created\"');\n}\n\nconst recipients = (body.recipients || []).filter((r) => r && r.email);\nif (recipients.length === 0) {\n  // Nobody enrolled (or nobody has an email) — stop quietly.\n  return [];\n}\n\nconst content = body.content || {};\nconst course = body.course || {};\n\n// Deadline arrives as an ISO string, or null for items without one.\nlet deadlineText = 'No deadline set';\nif (content.deadline) {\n  const d = new Date(content.deadline);\n  if (!isNaN(d.getTime())) {\n    deadlineText = d.toLocaleString('en-GB', {\n      day: 'numeric',\n      month: 'long',\n      year: 'numeric',\n      hour: '2-digit',\n      minute: '2-digit',\n    });\n  }\n}\n\nreturn [\n  {\n    json: {\n      kind: body.kind || 'assignment',\n      kindLabel: body.kindLabel || 'Assignment',\n      title: content.title || 'New coursework',\n      description: content.description || '',\n      deadline: content.deadline || null,\n      deadlineText,\n      totalMarks: content.totalMarks || 0,\n      link: content.link || '',\n      courseTitle: course.title || 'your course',\n      instructorName: (body.instructor || {}).name || 'Your instructor',\n      recipients,\n      recipientCount: recipients.length,\n    },\n  },\n];"
+      },
+      "id": "b02271d4-44fa-471e-bde9-130a19774d8a",
+      "name": "Validate & Normalize Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are writing the body copy for a short notification email sent to students on a learning platform.\n\nType: {{ $json.kindLabel }}\nTitle: {{ $json.title }}\nCourse: {{ $json.courseTitle }}\nInstructor: {{ $json.instructorName }}\nDeadline: {{ $json.deadlineText }}\nTotal marks: {{ $json.totalMarks }}\nInstructor's description: {{ $json.description }}\n\nWrite two or three short sentences telling the students what has been posted and what they should do next. Mention the deadline naturally if one is set. Keep it warm, plain and direct — no hype, no exclamation marks.\n\nReturn ONLY those sentences. No greeting, no sign-off, no subject line, no markdown, no bullet points, no placeholder names."
+      },
+      "id": "0698016d-417d-439d-8c3b-04b21b19f149",
+      "name": "AI Email Writer",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.6,
+      "position": [
+        448,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The LLM node returns its text under a different key depending on version,\n// so all the usual ones are tried before falling back to a written sentence.\nconst ai = $input.first().json || {};\nconst event = $('Validate & Normalize Event').first().json;\n\nlet copy = (ai.text ?? ai.response ?? ai.output ?? ai.content ?? '').toString().trim();\n\n// Models sometimes wrap the answer in a markdown fence.\ncopy = copy.replace(/^```[a-z]*\\s*/i, '').replace(/```\\s*$/, '').trim();\n\nif (!copy) {\n  copy =\n    event.instructorName +\n    ' has posted a new ' +\n    event.kindLabel.toLowerCase() +\n    ' for ' +\n    event.courseTitle +\n    '. Open SmartLMS to read the brief and submit before the deadline.';\n}\n\nreturn [{ json: { ...event, aiCopy: copy } }];"
+      },
+      "id": "9abc814c-8f60-41eb-a4f9-4a1827f89cf1",
+      "name": "Capture AI Copy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "recipients",
+        "include": "allOtherFields",
+        "options": {
+          "destinationFieldName": ""
+        }
+      },
+      "id": "d36f09b2-24cd-404d-ad41-cbf92a8caaf6",
+      "name": "Split Out Recipients",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        912,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per student (Split Out ran on `recipients`).\n//\n// The event fields are read with a fallback to the Capture AI Copy node, so the\n// email still fills in correctly even if Split Out is set to drop other fields.\nconst source = $('Capture AI Copy').first().json;\nconst roster = Array.isArray(source.recipients) ? source.recipients : [];\n\nconst THEME = {\n  assignment: { accent: '#4338ca', soft: '#eceafd', label: 'Assignment' },\n  quiz:       { accent: '#0f766e', soft: '#dcf5f1', label: 'Quiz' },\n  exam:       { accent: '#be123c', soft: '#fbe0e6', label: 'Exam' },\n  project:    { accent: '#a1600a', soft: '#fcefd9', label: 'Project' },\n};\n\nconst esc = (s) =>\n  String(s ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\nconst pick = (row, key, fallback = '') => {\n  const v = row[key] ?? source[key];\n  return v === undefined || v === null || v === '' ? fallback : v;\n};\n\nreturn $input.all().map((item, index) => {\n  const row = item.json;\n\n  // The recipient can arrive in a few shapes depending on how Split Out is\n  // configured (destination field set, \"other fields\" dropped, etc). Fall back\n  // to the roster from the webhook payload, matched by position, so the email\n  // address is never lost.\n  const fallback = roster[index] || roster[0] || {};\n  const nested =\n    (row.recipients && typeof row.recipients === 'object' ? row.recipients : null) ||\n    (row.recipient && typeof row.recipient === 'object' ? row.recipient : null) ||\n    {};\n\n  const email = row.email || row.to || nested.email || fallback.email || '';\n  const studentName = row.name || nested.name || fallback.name || '';\n  const studentFirst =\n    row.first_name || nested.first_name || fallback.first_name || studentName;\n\n  if (!email) {\n    throw new Error(\n      'No email address for this recipient. Check the Split Out Recipients node — ' +\n        'Field to Split Out must be \"recipients\" and Destination Field Name must be empty.'\n    );\n  }\n\n  const kind = pick(row, 'kind', 'assignment');\n  const theme = THEME[kind] || THEME.assignment;\n\n  const kindLabel = pick(row, 'kindLabel', theme.label);\n  const title = pick(row, 'title', 'New coursework');\n  const courseTitle = pick(row, 'courseTitle', 'your course');\n  const instructorName = pick(row, 'instructorName', 'Your instructor');\n  const deadlineText = pick(row, 'deadlineText', 'No deadline set');\n  const totalMarks = pick(row, 'totalMarks', 0);\n  const link = pick(row, 'link', 'http://localhost:3000/student');\n  const aiCopy = pick(\n    row,\n    'aiCopy',\n    `${instructorName} has posted a new ${kindLabel.toLowerCase()} for ${courseTitle}. Open SmartLMS to read the brief and submit before the deadline.`\n  );\n\n  const firstName = studentFirst || 'there';\n  const subject = `New ${kindLabel}: ${title} — ${courseTitle}`;\n\n  const detailRow = (label, value, strong) => `\n        <tr>\n          <td style=\"padding:13px 18px;border-bottom:1px solid #e9ebf4;font-size:12px;color:#6b7092;letter-spacing:.04em;text-transform:uppercase;\">${esc(label)}</td>\n          <td style=\"padding:13px 18px;border-bottom:1px solid #e9ebf4;font-size:14px;font-weight:600;text-align:right;color:${strong ? theme.accent : '#12142a'};\">${esc(value)}</td>\n        </tr>`;\n\n  const html = `\n<div style=\"margin:0;padding:32px 16px;background:#eef0f7;font-family:'Segoe UI',Helvetica,Arial,sans-serif;\">\n  <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;max-width:600px;margin:0 auto;border-collapse:separate;border-spacing:0;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 18px 40px -22px rgba(18,20,42,.45);\">\n\n    <!-- header -->\n    <tr>\n      <td style=\"background:linear-gradient(135deg,#16183a 0%,#2a2f66 55%,${theme.accent} 100%);padding:26px 32px;\">\n        <p style=\"margin:0;color:#ffffff;font-size:17px;font-weight:700;letter-spacing:.14em;\">SMARTLMS</p>\n        <p style=\"margin:5px 0 0;color:#b9bde4;font-size:12px;letter-spacing:.02em;\">Mari Energies Bootcamp &middot; Xloop Digital</p>\n      </td>\n    </tr>\n\n    <!-- accent hairline -->\n    <tr><td style=\"height:4px;background:${theme.accent};font-size:0;line-height:0;\">&nbsp;</td></tr>\n\n    <!-- body -->\n    <tr>\n      <td style=\"padding:32px;\">\n\n        <span style=\"display:inline-block;background:${theme.soft};color:${theme.accent};font-size:11px;font-weight:700;letter-spacing:.1em;padding:6px 13px;border-radius:999px;text-transform:uppercase;\">\n          New ${esc(kindLabel)}\n        </span>\n\n        <h1 style=\"margin:18px 0 6px;font-size:23px;line-height:1.3;color:#12142a;font-weight:700;\">${esc(title)}</h1>\n        <p style=\"margin:0 0 26px;font-size:14px;color:#6b7092;\">\n          <span style=\"color:${theme.accent};font-weight:600;\">${esc(courseTitle)}</span>\n          &nbsp;&middot;&nbsp; ${esc(instructorName)}\n        </p>\n\n        <p style=\"margin:0 0 8px;font-size:15px;color:#12142a;font-weight:600;\">Hi ${esc(firstName)},</p>\n        <p style=\"margin:0 0 26px;font-size:15px;line-height:1.7;color:#3a3f60;\">${esc(aiCopy)}</p>\n\n        <!-- details -->\n        <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;border-collapse:separate;border-spacing:0;background:#f7f8fc;border:1px solid #e2e5f0;border-left:4px solid ${theme.accent};border-radius:12px;overflow:hidden;\">\n          ${detailRow('Type', kindLabel, false)}\n          ${detailRow('Deadline', deadlineText, true)}\n          ${detailRow('Total marks', totalMarks, false)}\n          <tr>\n            <td style=\"padding:13px 18px;font-size:12px;color:#6b7092;letter-spacing:.04em;text-transform:uppercase;\">Instructor</td>\n            <td style=\"padding:13px 18px;font-size:14px;font-weight:600;text-align:right;color:#12142a;\">${esc(instructorName)}</td>\n          </tr>\n        </table>\n\n        <!-- cta -->\n        <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:28px 0 6px;\">\n          <tr>\n            <td style=\"border-radius:11px;background:${theme.accent};box-shadow:0 8px 18px -8px ${theme.accent};\">\n              <a href=\"${esc(link)}\"\n                 style=\"display:inline-block;padding:14px 30px;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;letter-spacing:.01em;\">\n                Open in SmartLMS &nbsp;&rarr;\n              </a>\n            </td>\n          </tr>\n        </table>\n\n        <p style=\"margin:18px 0 0;font-size:12px;color:#8b90ad;line-height:1.6;\">\n          Trouble with the button? Paste this into your browser:<br>\n          <span style=\"color:${theme.accent};word-break:break-all;\">${esc(link)}</span>\n        </p>\n\n      </td>\n    </tr>\n\n    <!-- footer -->\n    <tr>\n      <td style=\"padding:20px 32px;border-top:1px solid #e2e5f0;background:#f7f8fc;\">\n        <p style=\"margin:0;font-size:11px;line-height:1.6;color:#8b90ad;\">\n          Automated message from <strong style=\"color:#5a5f80;\">SmartLMS</strong>. Please don't reply to this email &mdash;\n          post your questions on the course page instead.\n        </p>\n      </td>\n    </tr>\n\n  </table>\n</div>`.trim();\n\n  return { json: { to: email, studentName, subject, html } };\n});"
+      },
+      "id": "97fb0f4c-6b90-453f-92f1-9ce20e1fa07c",
+      "name": "Build SmartLMS Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "YOUR_SMTP_EMAIL@gmail.com",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "html": "={{ $json.html }}",
+        "options": {}
+      },
+      "id": "23e7589c-93e8-4ab2-94cc-dc35d570a899",
+      "name": "Send SmartLMS Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1344,
+        368
+      ],
+      "webhookId": "c2067a33-560d-4808-94b8-652d727b12c5",
+      "credentials": {
+        "smtp": {
+          "id": "BrnmFOZwo8Ec9cBe",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "groq/compound-mini",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        384,
+        576
+      ],
+      "id": "bfa11acb-9395-4651-bc14-ae6ad3b0ae36",
+      "name": "Groq Chat Model",
+      "credentials": {
+        "groqApi": {
+          "id": "dsJhL6BVd9hx2no7",
+          "name": "Groq account 3"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "SmartLMS Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate & Normalize Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Normalize Event": {
+      "main": [
+        [
+          {
+            "node": "AI Email Writer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Email Writer": {
+      "main": [
+        [
+          {
+            "node": "Capture AI Copy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture AI Copy": {
+      "main": [
+        [
+          {
+            "node": "Split Out Recipients",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out Recipients": {
+      "main": [
+        [
+          {
+            "node": "Build SmartLMS Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build SmartLMS Email": {
+      "main": [
+        [
+          {
+            "node": "Send SmartLMS Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Email Writer",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "c0100933-b68c-44a1-a4f9-ecd9e734dd9a",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3317b543d0036ad5e432c4c73b1e0f20599537efcf9e9f461b6b7638768eb74d"
+  },
+  "id": "Xiq9OmzvqtLb5UIhRciSu",
+  "tags": []
+}

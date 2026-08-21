@@ -131,30 +131,71 @@ async def update_course(
     user: dict = Depends(require_roles("instructor", "admin")),
 ):
     db = database.db
-    course = await db.courses.find_one({"_id": ObjectId(course_id)})
-    if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
 
-    # instructors can only edit their own courses
-    if user["role"] == "instructor" and course.get("instructorId") != str(user["_id"]):
-        raise HTTPException(status_code=403, detail="Not allowed to edit this course")
+    if not ObjectId.is_valid(course_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid course ID"
+        )
+
+    course = await db.courses.find_one(
+        {"_id": ObjectId(course_id)}
+    )
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Course not found"
+        )
+
+    # Instructors can only edit their own courses
+    if (
+        user["role"] == "instructor"
+        and course.get("instructorId") != str(user["_id"])
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Not allowed to edit this course"
+        )
 
     updates = payload.dict(exclude_unset=True)
-    if "durationWeeks" in updates:
-        pass  # already camelCase, no remapping needed
+
     if updates:
         updates["updatedAt"] = datetime.utcnow()
-        await db.courses.update_one({"_id": ObjectId(course_id)}, {"$set": updates})
 
-    updated = await db.courses.find_one({"_id": ObjectId(course_id)})
+        await db.courses.update_one(
+            {"_id": ObjectId(course_id)},
+            {"$set": updates}
+        )
+
+    updated = await db.courses.find_one(
+        {"_id": ObjectId(course_id)}
+    )
+
     result = course_to_public(updated)
-    if result["instructorId"] and ObjectId.is_valid(result["instructorId"]):
-        instructor = await db.users.find_one({"_id": ObjectId(result["instructorId"])})
-        result["instructorName"] = instructor.get("name", "") if instructor else ""
+
+    if result.get("instructorId") and ObjectId.is_valid(
+        result["instructorId"]
+    ):
+        instructor = await db.users.find_one(
+            {"_id": ObjectId(result["instructorId"])}
+        )
+
+        result["instructorName"] = (
+            instructor.get("name", "")
+            if instructor
+            else ""
+        )
+
     result["studentCount"] = await db.enrollments.count_documents(
         {"courseId": course_id}
     )
-    return {"success": True, "data": result, "message": "course updated"}
+
+    return {
+        "success": True,
+        "data": result,
+        "message": "course updated"
+    }
 
 
 @router.delete("/{course_id}")

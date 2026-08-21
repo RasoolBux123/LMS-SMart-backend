@@ -256,6 +256,48 @@ async def mark_all_read(user: dict = Depends(get_current_user)):
         "message": "all marked as read",
     }
 
+@router.post("/generate-risk-alerts")
+async def generate_risk_alerts(
+    course_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Pull AI risk insights for a course and notify the calling instructor
+    about students flagged at_risk or failure_risk. Deduped by not re-alerting
+    on students already unread-notified for the same risk level."""
+    from app.services.ai_insights import get_all_insights_for_course
+
+    insights = await get_all_insights_for_course(course_id)
+    db = database.db
+    created = 0
+
+    for insight in insights:
+        risk = insight.get("risk_category")
+        if risk not in ("at_risk", "failure_risk"):
+            continue
+
+        student_id = insight["student_id"]
+        dedupe_check = await db.notifications.find_one({
+            "userId": str(user["_id"]),
+            "kind": "risk_alert",
+            "courseworkId": f"{student_id}:{course_id}:{risk}",
+            "read": False,
+        })
+        if dedupe_check:
+            continue  # already alerted, avoid spam
+
+        label = "Failure risk" if risk == "failure_risk" else "At risk"
+        await create_notification(
+            user_id=str(user["_id"]),
+            title=f"{label}: {student_id}",
+            body=insight.get("instructor_insight", ""),
+            kind="risk_alert",
+            link="/instructor/ai-insights",
+            course_id=course_id,
+            coursework_id=f"{student_id}:{course_id}:{risk}",  # reused as dedupe key
+        )
+        created += 1
+
+    return {"success": True, "created": created}
 # """
 # Notifications API.
 
